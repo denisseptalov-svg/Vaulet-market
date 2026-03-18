@@ -3,6 +3,7 @@ const express   = require('express');
 const http      = require('http');
 const WebSocket = require('ws');
 const path      = require('path');
+const crypto    = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 
 const app    = express();
@@ -16,7 +17,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 //  SKIN IMAGE MAP
 // ═══════════════════════════════════════════════════
 let SKIN_IMG = {};
-
 async function loadSkinImages() {
   try {
     console.log('⏳ Загружаю текстуры скинов...');
@@ -24,9 +24,19 @@ async function loadSkinImages() {
     const list = await res.json();
     list.forEach(s => { if (s.image) SKIN_IMG[s.name] = s.image; });
     console.log(`✅ Загружено ${Object.keys(SKIN_IMG).length} текстур`);
-  } catch(e) {
-    console.warn('⚠️  Текстуры не загружены:', e.message);
-  }
+  } catch(e) { console.warn('⚠️  Текстуры не загружены:', e.message); }
+}
+
+// ═══════════════════════════════════════════════════
+//  PASSWORD HASHING
+// ═══════════════════════════════════════════════════
+function hashPassword(password, salt) {
+  if (!salt) salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.createHmac('sha256', salt).update(password).digest('hex');
+  return { hash, salt };
+}
+function verifyPassword(password, hash, salt) {
+  return hashPassword(password, salt).hash === hash;
 }
 
 // ═══════════════════════════════════════════════════
@@ -51,9 +61,6 @@ const WEARS = [
   { name:'Battle-Scarred', short:'BS', mult:0.58, range:[0.45,1.00] },
 ];
 
-// ═══════════════════════════════════════════════════
-//  CASES
-// ═══════════════════════════════════════════════════
 const CASES = [
   {
     id:'neon-storm', name:'Neon Storm Case', price:150,
@@ -258,7 +265,7 @@ function getRarity(n){ return RARITIES.find(r=>r.name===n)||RARITIES[0]; }
 function getWear(f)  { return WEARS.find(w=>f>=w.range[0]&&f<w.range[1])||WEARS[4]; }
 function getImg(w,s) { return SKIN_IMG[`${w} | ${s}`]||null; }
 
-function rollRarity(pool) {
+function rollRarity(pool){
   const r=Math.random(); let cum=0;
   for(let i=RARITIES.length-1;i>=0;i--){
     cum+=RARITIES[i].chance;
@@ -280,75 +287,187 @@ function buildItem(caseId,wpObj,ownerId){
 }
 
 function enrichedCases(){
-  return CASES.map(c=>({...c, items:c.items.map(it=>({...it, image:getImg(it.weapon,it.skin), rarColor:getRarity(it.rarity).color}))}));
+  return CASES.map(c=>({...c,items:c.items.map(it=>({...it,image:getImg(it.weapon,it.skin),rarColor:getRarity(it.rarity).color}))}));
 }
 
 function makeStarterItems(uid){
   const picks=[
-    {caseId:'neon-storm',  weapon:'AK-47',      skin:'Blue Laminate',   rarity:'Consumer Grade'},
-    {caseId:'shadow-ops',  weapon:'Five-SeveN',  skin:'Monkey Business', rarity:'Consumer Grade'},
-    {caseId:'chroma',      weapon:'Galil AR',    skin:'Cerberus',        rarity:'Consumer Grade'},
+    {caseId:'neon-storm',  weapon:'AK-47',     skin:'Blue Laminate',   rarity:'Consumer Grade'},
+    {caseId:'shadow-ops',  weapon:'Five-SeveN', skin:'Monkey Business', rarity:'Consumer Grade'},
+    {caseId:'chroma',      weapon:'Galil AR',   skin:'Cerberus',        rarity:'Consumer Grade'},
   ];
   return picks.map(p=>buildItem(p.caseId,p,uid));
+}
+
+function inventoryValue(inventory){
+  return inventory.reduce((s,i)=>s+(i.price||0),0);
+}
+
+function netWorth(user){
+  return user.balance + inventoryValue(user.inventory);
 }
 
 // ═══════════════════════════════════════════════════
 //  STATE
 // ═══════════════════════════════════════════════════
-const users=new Map(), market=new Map(), clients=new Map();
-function uPub(u){return {id:u.id,name:u.name,balance:u.balance,inventory:u.inventory,soldCount:u.soldCount||0};}
-function mktList(){return Array.from(market.values()).sort((a,b)=>b.listedAt-a.listedAt);}
+// users: Map<userId, userObject>
+// usernames: Map<username_lower, userId>  — fast lookup
+const users     = new Map();
+const usernames = new Map(); // lowercase username → userId
+const sessions  = new Map(); // token → userId
+const market    = new Map();
+const clients   = new Map(); // ws → userId
+
+function uPub(u){
+  return { id:u.id, name:u.name, balance:u.balance, inventory:u.inventory,
+           soldCount:u.soldCount||0, createdAt:u.createdAt };
+}
+function mktList(){ return Array.from(market.values()).sort((a,b)=>b.listedAt-a.listedAt); }
+
+function generateToken(){ return crypto.randomBytes(32).toString('hex'); }
 
 // ═══════════════════════════════════════════════════
 //  BROADCAST
 // ═══════════════════════════════════════════════════
-function broadcast(data,skip=null){const m=JSON.stringify(data);wss.clients.forEach(ws=>{if(ws!==skip&&ws.readyState===WebSocket.OPEN)ws.send(m);});}
+function broadcast(data,skip=null){
+  const m=JSON.stringify(data);
+  wss.clients.forEach(ws=>{if(ws!==skip&&ws.readyState===WebSocket.OPEN)ws.send(m);});
+}
 function sendTo(ws,data){if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(data));}
 function bStats(){broadcast({type:'stats',online:wss.clients.size,listings:market.size});}
 
 // ═══════════════════════════════════════════════════
-//  API
+//  AUTH MIDDLEWARE  (token in body or header)
 // ═══════════════════════════════════════════════════
-app.post('/api/auth',(req,res)=>{
-  const{userId,name}=req.body||{};
-  if(userId&&users.has(userId)){const u=users.get(userId);if(name&&name.trim())u.name=name.trim().slice(0,20);return res.json({user:uPub(u),cases:enrichedCases(),market:mktList()});}
-  const id=uuidv4(),uName=(name&&name.trim())?name.trim().slice(0,20):`Player_${id.slice(0,5).toUpperCase()}`;
-  const user={id,name:uName,balance:1500,inventory:makeStarterItems(id),soldCount:0};
-  users.set(id,user);
-  res.json({user:uPub(user),cases:enrichedCases(),market:mktList(),isNew:true});
+function authMiddleware(req,res,next){
+  const token = req.body?.token || req.headers['x-token'];
+  if(!token||!sessions.has(token)) return res.status(401).json({error:'Не авторизован'});
+  req.userId = sessions.get(token);
+  req.user   = users.get(req.userId);
+  if(!req.user) return res.status(401).json({error:'Пользователь не найден'});
+  next();
+}
+
+// ═══════════════════════════════════════════════════
+//  AUTH ROUTES
+// ═══════════════════════════════════════════════════
+
+// Register
+app.post('/api/register',(req,res)=>{
+  let { username, password } = req.body||{};
+  if(!username||!password) return res.status(400).json({error:'Введите логин и пароль'});
+  username = username.trim().slice(0,20);
+  if(username.length<3) return res.status(400).json({error:'Логин минимум 3 символа'});
+  if(password.length<4) return res.status(400).json({error:'Пароль минимум 4 символа'});
+  if(usernames.has(username.toLowerCase())) return res.status(400).json({error:'Этот логин уже занят'});
+
+  const id = uuidv4();
+  const { hash, salt } = hashPassword(password);
+  const user = {
+    id, name: username,
+    passwordHash: hash, passwordSalt: salt,
+    balance: 1500,
+    inventory: makeStarterItems(id),
+    soldCount: 0,
+    createdAt: Date.now(),
+  };
+  users.set(id, user);
+  usernames.set(username.toLowerCase(), id);
+
+  const token = generateToken();
+  sessions.set(token, id);
+
+  res.json({ token, user: uPub(user), cases: enrichedCases(), market: mktList(), isNew: true });
 });
 
-app.post('/api/open-case',(req,res)=>{
-  const{userId,caseId}=req.body||{};
-  const u=users.get(userId),c=CASES.find(x=>x.id===caseId);
-  if(!u||!c)return res.status(400).json({error:'Неверный запрос'});
-  if(u.balance<c.price)return res.status(400).json({error:'Недостаточно монет'});
+// Login
+app.post('/api/login',(req,res)=>{
+  let { username, password } = req.body||{};
+  if(!username||!password) return res.status(400).json({error:'Введите логин и пароль'});
+  username = username.trim();
+  const userId = usernames.get(username.toLowerCase());
+  if(!userId) return res.status(400).json({error:'Пользователь не найден'});
+  const user = users.get(userId);
+  if(!verifyPassword(password, user.passwordHash, user.passwordSalt))
+    return res.status(400).json({error:'Неверный пароль'});
+
+  const token = generateToken();
+  sessions.set(token, userId);
+
+  res.json({ token, user: uPub(user), cases: enrichedCases(), market: mktList() });
+});
+
+// Resume session (auto-login by token)
+app.post('/api/resume',(req,res)=>{
+  const { token } = req.body||{};
+  if(!token||!sessions.has(token)) return res.status(401).json({error:'Сессия истекла'});
+  const userId = sessions.get(token);
+  const user   = users.get(userId);
+  if(!user) return res.status(401).json({error:'Не найден'});
+  res.json({ token, user: uPub(user), cases: enrichedCases(), market: mktList() });
+});
+
+// Logout
+app.post('/api/logout', authMiddleware,(req,res)=>{
+  const token = req.body?.token || req.headers['x-token'];
+  sessions.delete(token);
+  res.json({ ok: true });
+});
+
+// Leaderboard
+app.get('/api/leaderboard',(req,res)=>{
+  const list = Array.from(users.values())
+    .map(u=>({
+      id: u.id,
+      name: u.name,
+      balance: u.balance,
+      inventoryValue: inventoryValue(u.inventory),
+      netWorth: netWorth(u),
+      itemCount: u.inventory.length,
+      soldCount: u.soldCount||0,
+      createdAt: u.createdAt,
+    }))
+    .sort((a,b)=>b.netWorth-a.netWorth)
+    .slice(0,50);
+  res.json(list);
+});
+
+// ═══════════════════════════════════════════════════
+//  GAME ROUTES  (all require auth token in body)
+// ═══════════════════════════════════════════════════
+
+app.post('/api/open-case', authMiddleware,(req,res)=>{
+  const{caseId}=req.body; const u=req.user;
+  const c=CASES.find(x=>x.id===caseId);
+  if(!c) return res.status(400).json({error:'Кейс не найден'});
+  if(u.balance<c.price) return res.status(400).json({error:'Недостаточно монет'});
   u.balance-=c.price;
-  const item=buildItem(caseId,rollRarity(c.items),userId);
+  const item=buildItem(caseId,rollRarity(c.items),u.id);
   res.json({item,balance:u.balance});
   broadcast({type:'activity',msg:`<b>${u.name}</b> открыл <b>${c.name}</b> → ${item.weapon} | ${item.skin} <span style="color:${item.rarColor}">[${item.rarity}]</span>`});
 });
 
-app.post('/api/keep-item',(req,res)=>{
-  const{userId,item}=req.body||{};const u=users.get(userId);
-  if(!u||!item)return res.status(400).json({error:'Ошибка'});
-  item.ownerId=userId;item.id=rng(100000,999999);u.inventory.push(item);res.json({inventory:u.inventory});
+app.post('/api/keep-item', authMiddleware,(req,res)=>{
+  const{item}=req.body; const u=req.user;
+  if(!item) return res.status(400).json({error:'Нет данных'});
+  item.ownerId=u.id; item.id=rng(100000,999999);
+  u.inventory.push(item); res.json({inventory:u.inventory});
 });
 
-app.post('/api/sell-won',(req,res)=>{
-  const{userId,item}=req.body||{};const u=users.get(userId);
-  if(!u||!item)return res.status(400).json({error:'Ошибка'});
-  u.balance+=item.price;u.soldCount=(u.soldCount||0)+1;res.json({balance:u.balance});
+app.post('/api/sell-won', authMiddleware,(req,res)=>{
+  const{item}=req.body; const u=req.user;
+  if(!item) return res.status(400).json({error:'Нет данных'});
+  u.balance+=item.price; u.soldCount=(u.soldCount||0)+1;
+  res.json({balance:u.balance});
 });
 
-app.post('/api/list',(req,res)=>{
-  const{userId,itemId,price}=req.body||{};const u=users.get(userId);
-  if(!u)return res.status(400).json({error:'Не найден'});
+app.post('/api/list', authMiddleware,(req,res)=>{
+  const{itemId,price}=req.body; const u=req.user;
   const idx=u.inventory.findIndex(i=>i.id===itemId);
-  if(idx<0)return res.status(400).json({error:'Предмет не найден'});
-  const p=parseInt(price);if(!p||p<1)return res.status(400).json({error:'Неверная цена'});
+  if(idx<0) return res.status(400).json({error:'Предмет не найден'});
+  const p=parseInt(price); if(!p||p<1) return res.status(400).json({error:'Неверная цена'});
   const item=u.inventory.splice(idx,1)[0];
-  const listing={id:rng(100000,999999),item,sellerId:userId,sellerName:u.name,price:p,listedAt:Date.now()};
+  const listing={id:rng(100000,999999),item,sellerId:u.id,sellerName:u.name,price:p,listedAt:Date.now()};
   market.set(listing.id,listing);
   res.json({inventory:u.inventory,listing});
   broadcast({type:'listing_add',listing});
@@ -356,15 +475,16 @@ app.post('/api/list',(req,res)=>{
   bStats();
 });
 
-app.post('/api/buy',(req,res)=>{
-  const{userId,listingId}=req.body||{};const u=users.get(userId),l=market.get(listingId);
-  if(!u||!l)return res.status(400).json({error:'Лот не найден'});
-  if(l.sellerId===userId)return res.status(400).json({error:'Нельзя купить свой лот'});
-  if(u.balance<l.price)return res.status(400).json({error:'Недостаточно монет'});
+app.post('/api/buy', authMiddleware,(req,res)=>{
+  const{listingId}=req.body; const u=req.user;
+  const l=market.get(listingId);
+  if(!l) return res.status(400).json({error:'Лот не найден'});
+  if(l.sellerId===u.id) return res.status(400).json({error:'Нельзя купить свой лот'});
+  if(u.balance<l.price) return res.status(400).json({error:'Недостаточно монет'});
   u.balance-=l.price;
   const seller=users.get(l.sellerId);
   if(seller){seller.balance+=l.price;seller.soldCount=(seller.soldCount||0)+1;}
-  u.inventory.push({...l.item,id:rng(100000,999999),ownerId:userId});
+  u.inventory.push({...l.item,id:rng(100000,999999),ownerId:u.id});
   market.delete(listingId);
   res.json({balance:u.balance,inventory:u.inventory});
   broadcast({type:'listing_rm',listingId});
@@ -373,23 +493,24 @@ app.post('/api/buy',(req,res)=>{
   bStats();
 });
 
-app.post('/api/cancel',(req,res)=>{
-  const{userId,listingId}=req.body||{};const u=users.get(userId),l=market.get(listingId);
-  if(!u||!l)return res.status(400).json({error:'Не найден'});
-  if(l.sellerId!==userId)return res.status(400).json({error:'Нет прав'});
-  market.delete(listingId);u.inventory.push(l.item);res.json({inventory:u.inventory});
-  broadcast({type:'listing_rm',listingId});bStats();
+app.post('/api/cancel', authMiddleware,(req,res)=>{
+  const{listingId}=req.body; const u=req.user;
+  const l=market.get(listingId);
+  if(!l) return res.status(400).json({error:'Лот не найден'});
+  if(l.sellerId!==u.id) return res.status(400).json({error:'Нет прав'});
+  market.delete(listingId);
+  u.inventory.push(l.item);
+  res.json({inventory:u.inventory});
+  broadcast({type:'listing_rm',listingId}); bStats();
 });
 
-// CRAFT: 3-10 предметов одной редкости → 1 предмет той же редкости с лучшим wear
-app.post('/api/craft',(req,res)=>{
-  const{userId,itemIds}=req.body||{};const u=users.get(userId);
-  if(!u)return res.status(400).json({error:'Не найден'});
-  if(!Array.isArray(itemIds)||itemIds.length<3||itemIds.length>10)return res.status(400).json({error:'Нужно 3-10 предметов'});
+app.post('/api/craft', authMiddleware,(req,res)=>{
+  const{itemIds}=req.body; const u=req.user;
+  if(!Array.isArray(itemIds)||itemIds.length<3||itemIds.length>10) return res.status(400).json({error:'Нужно 3-10 предметов'});
   const items=itemIds.map(id=>u.inventory.find(i=>i.id===id)).filter(Boolean);
-  if(items.length!==itemIds.length)return res.status(400).json({error:'Предметы не найдены'});
+  if(items.length!==itemIds.length) return res.status(400).json({error:'Предметы не найдены'});
   const rar=items[0].rarity;
-  if(!items.every(i=>i.rarity===rar))return res.status(400).json({error:'Все предметы должны быть одной редкости'});
+  if(!items.every(i=>i.rarity===rar)) return res.status(400).json({error:'Все предметы должны быть одной редкости'});
   itemIds.forEach(id=>{const idx=u.inventory.findIndex(i=>i.id===id);if(idx>=0)u.inventory.splice(idx,1);});
   const pool=[];CASES.forEach(c=>c.items.filter(it=>it.rarity===rar).forEach(it=>pool.push({...it,caseId:c.id})));
   const wpObj=pool[rng(0,pool.length-1)];
@@ -399,33 +520,33 @@ app.post('/api/craft',(req,res)=>{
   const wear=getWear(f);
   const result={id:rng(100000,999999),weapon:wpObj.weapon,skin:wpObj.skin,rarity:rar,rarColor:rarDef.color,
     caseOrigin:'🔨 Крафт',float:f,wear:wear.name,wearShort:wear.short,
-    price:Math.round(rng(...rarDef.basePrice)*wear.mult),image:getImg(wpObj.weapon,wpObj.skin),ownerId:userId};
-  u.inventory.push(result);res.json({result,inventory:u.inventory});
+    price:Math.round(rng(...rarDef.basePrice)*wear.mult),image:getImg(wpObj.weapon,wpObj.skin),ownerId:u.id};
+  u.inventory.push(result);
+  res.json({result,inventory:u.inventory});
   broadcast({type:'activity',msg:`<b>${u.name}</b> скрафтил <b>${result.weapon} | ${result.skin}</b> <span style="color:${result.rarColor}">[${result.rarity}]</span>`});
 });
 
-// CONTRACT: ровно 10 предметов одной редкости → 1 предмет следующей редкости
-app.post('/api/contract',(req,res)=>{
-  const{userId,itemIds}=req.body||{};const u=users.get(userId);
-  if(!u)return res.status(400).json({error:'Не найден'});
-  if(!Array.isArray(itemIds)||itemIds.length!==10)return res.status(400).json({error:'Нужно ровно 10 предметов'});
+app.post('/api/contract', authMiddleware,(req,res)=>{
+  const{itemIds}=req.body; const u=req.user;
+  if(!Array.isArray(itemIds)||itemIds.length!==10) return res.status(400).json({error:'Нужно ровно 10 предметов'});
   const items=itemIds.map(id=>u.inventory.find(i=>i.id===id)).filter(Boolean);
-  if(items.length!==10)return res.status(400).json({error:'Предметы не найдены'});
+  if(items.length!==10) return res.status(400).json({error:'Предметы не найдены'});
   const rar=items[0].rarity;
-  if(!items.every(i=>i.rarity===rar))return res.status(400).json({error:'Все 10 предметов должны быть одной редкости'});
+  if(!items.every(i=>i.rarity===rar)) return res.status(400).json({error:'Все 10 предметов должны быть одной редкости'});
   const rarIdx=RARITY_ORDER.indexOf(rar);
-  if(rarIdx>=RARITY_ORDER.length-1)return res.status(400).json({error:'Нельзя улучшить ★ Special'});
+  if(rarIdx>=RARITY_ORDER.length-1) return res.status(400).json({error:'Нельзя улучшить ★ Special'});
   const nextRar=RARITY_ORDER[rarIdx+1];
   const pool=[];CASES.forEach(c=>c.items.filter(it=>it.rarity===nextRar).forEach(it=>pool.push({...it,caseId:c.id})));
-  if(!pool.length)return res.status(400).json({error:'Нет предметов следующей редкости'});
+  if(!pool.length) return res.status(400).json({error:'Нет предметов следующей редкости'});
   itemIds.forEach(id=>{const idx=u.inventory.findIndex(i=>i.id===id);if(idx>=0)u.inventory.splice(idx,1);});
   const wpObj=pool[rng(0,pool.length-1)];
   const nextDef=getRarity(nextRar);
   const f=rnf(0,0.70);const wear=getWear(f);
   const result={id:rng(100000,999999),weapon:wpObj.weapon,skin:wpObj.skin,rarity:nextRar,rarColor:nextDef.color,
     caseOrigin:'📋 Контракт',float:f,wear:wear.name,wearShort:wear.short,
-    price:Math.round(rng(...nextDef.basePrice)*wear.mult),image:getImg(wpObj.weapon,wpObj.skin),ownerId:userId};
-  u.inventory.push(result);res.json({result,inventory:u.inventory});
+    price:Math.round(rng(...nextDef.basePrice)*wear.mult),image:getImg(wpObj.weapon,wpObj.skin),ownerId:u.id};
+  u.inventory.push(result);
+  res.json({result,inventory:u.inventory});
   broadcast({type:'activity',msg:`🎉 <b>${u.name}</b> выполнил контракт → <b>${result.weapon} | ${result.skin}</b> <span style="color:${result.rarColor}">[${result.rarity}]</span>`});
 });
 
@@ -436,9 +557,23 @@ app.get('/api/stats',(_,res)=>res.json({online:wss.clients.size,listings:market.
 // ═══════════════════════════════════════════════════
 wss.on('connection',ws=>{
   sendTo(ws,{type:'stats',online:wss.clients.size,listings:market.size});
-  ws.on('message',raw=>{ try{const m=JSON.parse(raw);if(m.type==='auth'){clients.set(ws,m.userId);bStats();}}catch(_){} });
-  ws.on('close',()=>{ clients.delete(ws);bStats(); });
+  ws.on('message',raw=>{
+    try{
+      const m=JSON.parse(raw);
+      if(m.type==='auth'&&m.token&&sessions.has(m.token)){
+        const uid=sessions.get(m.token);
+        clients.set(ws,uid); bStats();
+      }
+    }catch(_){}
+  });
+  ws.on('close',()=>{clients.delete(ws);bStats();});
 });
 
+// ═══════════════════════════════════════════════════
+//  BOOT
+// ═══════════════════════════════════════════════════
 const PORT=process.env.PORT||3000;
-server.listen(PORT,async()=>{ console.log(`\n🚀 VAULT.MARKET → http://localhost:${PORT}\n`); await loadSkinImages(); });
+server.listen(PORT,async()=>{
+  console.log(`\n🚀 VAULT.MARKET → http://localhost:${PORT}\n`);
+  await loadSkinImages();
+});
